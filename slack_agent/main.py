@@ -1,12 +1,27 @@
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from slack_agent.agent import SlackAgent
-from slack_agent.client import send_message
-from slack_agent.models import SlackMessage
-from slack_agent.tools import post_message, reply_to_thread
+from slack_agent.agent import SlackAgent, _parse
+from slack_agent.client import lookup_channel, send_message
+from slack_agent.models import SlackMessage, SlackResponse
 
-app = FastAPI(title="Slack Agent")
+logger = logging.getLogger(__name__)
+agent = SlackAgent()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    logger.info("slack agent starting")
+    yield
+    logger.info("slack agent shutting down")
+
+
+app = FastAPI(title="Slack Agent", lifespan=lifespan)
 
 
 class MessageRequest(BaseModel):
@@ -31,6 +46,19 @@ class ThreadResponse(BaseModel):
     channel: str
 
 
+class HandleRequest(BaseModel):
+    text: str
+
+
+class HandleResponse(BaseModel):
+    ok: bool
+    error: str | None = None
+    command: str
+    channel: str | None = None
+    thread_ts: str | None = None
+    data: dict | None = None
+
+
 @app.post("/message", response_model=PostResponse)
 def send_slack_message(request: MessageRequest) -> PostResponse:
     message = SlackMessage(
@@ -40,12 +68,11 @@ def send_slack_message(request: MessageRequest) -> PostResponse:
         username=request.username,
         icon_emoji=request.icon_emoji,
     )
-    agent = SlackAgent()
-    result = agent.send(message)
+    response = send_message(message)
     return PostResponse(
-        ok=result["ok"],
-        error=result.get("error"),
-        data=result.get("data"),
+        ok=response.ok,
+        error=response.error,
+        data=response.data,
         channel=request.channel,
     )
 
@@ -61,11 +88,10 @@ def reply_to_slack_thread(request: MessageRequest) -> ThreadResponse:
         username=request.username,
         icon_emoji=request.icon_emoji,
     )
-    agent = SlackAgent()
-    result = agent.send(message)
+    response = send_message(message)
     return ThreadResponse(
-        ok=result["ok"],
-        error=result.get("error"),
+        ok=response.ok,
+        error=response.error,
         thread_ts=request.thread_ts,
         channel=request.channel,
     )
@@ -78,12 +104,40 @@ def health() -> dict:
 
 @app.post("/tools/post_message")
 def tool_post_message(channel: str, text: str) -> dict:
+    from slack_agent.tools import post_message
+
     return post_message(channel=channel, text=text)
 
 
 @app.post("/tools/reply_to_thread")
 def tool_reply_to_thread(channel: str, text: str, thread_ts: str) -> dict:
+    from slack_agent.tools import reply_to_thread
+
     return reply_to_thread(channel=channel, text=text, thread_ts=thread_ts)
+
+
+@app.post("/handle", response_model=HandleResponse)
+def handle_prompt(request: HandleRequest) -> HandleResponse:
+    result = agent.handle(request.text)
+    return HandleResponse(
+        ok=result.get("ok", False),
+        error=result.get("error"),
+        command=result.get("command", "unknown"),
+        channel=result.get("channel"),
+        thread_ts=result.get("thread_ts"),
+        data=result.get("data"),
+    )
+
+
+@app.post("/channels/lookup")
+def channels_lookup(name: str) -> dict:
+    response = lookup_channel(name)
+    return {
+        "ok": response.ok,
+        "error": response.error,
+        "channel": name,
+        "data": response.data,
+    }
 
 
 def run() -> None:
